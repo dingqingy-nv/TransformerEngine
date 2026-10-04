@@ -353,9 +353,26 @@ def test_init_method_and_rng_tracker(deferred_init: bool) -> None:
         assert all(param.device.type == "meta" for param in op.parameters())
 
     inp = torch.randn(32, 2, 32, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    if deferred_init:
+        with pytest.raises(RuntimeError, match="reset_parameters"):
+            op(inp)
+        assert not events
+        assert all(param.device.type == "meta" for param in op.parameters())
+        op.reset_parameters()
+
+    inp_ref = _to_reference(inp, requires_grad=True)
+    weight_ref = _to_reference(op.weight, requires_grad=True)
+    bias_ref = _to_reference(op.bias, requires_grad=True)
+    output_ref = _reference_linear(inp_ref, weight_ref, bias_ref, op.batch_dim)
+    output_ref.sum().backward()
     output = op(inp)
     output.sum().backward()
 
+    tols = dtype_tols(torch.bfloat16)
+    assert_close(output, output_ref, **tols)
+    assert_close(inp.grad, inp_ref.grad, **tols)
+    assert_close(op.weight.grad, weight_ref.grad, **tols)
+    assert_close(op.bias.grad, bias_ref.grad, **tols)
     assert events == ["tracker", "enter", "init", "exit"]
     torch.testing.assert_close(
         op.weight,
@@ -372,7 +389,7 @@ def test_init_method_and_rng_tracker(deferred_init: bool) -> None:
 
 @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
 def test_quantized_weight_deferred_init() -> None:
-    """Meta initialization materializes a primary MXFP8 weight on first use."""
+    """Explicit reset materializes a primary MXFP8 weight before first use."""
     recipe = make_recipe("mxfp8")
     with te.quantized_model_init(enabled=True, recipe=recipe):
         op = te_ops.BatchedLinear(
@@ -383,6 +400,7 @@ def test_quantized_weight_deferred_init() -> None:
             dtype=torch.bfloat16,
         )
     assert all(param.device.type == "meta" for param in op.parameters())
+    op.reset_parameters()
 
     inp = torch.randn(32, 2, 32, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     with te.autocast(enabled=True, recipe=recipe):

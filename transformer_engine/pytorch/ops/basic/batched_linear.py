@@ -88,8 +88,9 @@ class BatchedLinear(BasicOperation):
     Notes
     -----
     Constructing this operation under ``quantized_model_init`` supports only
-    an MXFP8 recipe. Meta-device parameter materialization relies on the
-    operation fuser's deferred-initialization support.
+    an MXFP8 recipe. After constructing on the meta device, call
+    ``reset_parameters()`` to materialize parameters before the first forward
+    pass.
     """
 
     num_extra_outputs: int = 0
@@ -227,11 +228,6 @@ class BatchedLinear(BasicOperation):
             if not isinstance(bias, torch.nn.Parameter):
                 bias = torch.nn.Parameter(bias, requires_grad=old_bias.requires_grad)
             self.bias = bias
-
-    def pre_first_fuser_forward(self) -> None:
-        super().pre_first_fuser_forward()
-        if self.weight.device.type == "meta":
-            self.reset_parameters()
 
     def num_quantizers(self, mode: str) -> int:
         if mode == "forward":
