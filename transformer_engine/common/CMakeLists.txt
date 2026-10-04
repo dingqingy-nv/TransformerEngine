@@ -443,11 +443,12 @@ target_link_options(
   "LINKER:-z,now"
 )
 if(NVTE_TARGET_IS_ARM64)
-  # The Cortex-A53 843419 workaround is applied by the linker.
+  # Disable the workaround through CMake's host link driver, including for
+  # CUDA targets. This is not an option for GNU ld or CUDA device linking.
   target_link_options(
     transformer_engine
     PRIVATE
-    "LINKER:--no-fix-cortex-a53-843419"
+    $<HOST_LINK:-mno-fix-cortex-a53-843419>
   )
 endif()
 
