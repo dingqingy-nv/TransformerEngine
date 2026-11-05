@@ -507,17 +507,23 @@ def test_rejects_non_mxfp8_recipe(recipe) -> None:
 @pytest.mark.parametrize("batch_dim", (0, -2))
 @pytest.mark.parametrize("quantized_weight", (False, True))
 @pytest.mark.parametrize("save_original_input", (False, True))
+@pytest.mark.parametrize("rows", (256, 160))
 def test_mxfp8_swizzled_scales_match_compact(
     monkeypatch: pytest.MonkeyPatch,
     *,
     batch_dim: int,
     quantized_weight: bool,
     save_original_input: bool,
+    rows: int,
 ) -> None:
-    """Scales packed per GEMM at quantization reproduce GEMM-side packing bitwise."""
+    """Scales packed per GEMM at quantization reproduce GEMM-side packing bitwise.
+
+    With 160 rows per GEMM the activations keep compact scales, packed by the
+    GEMM, while the weight keeps GEMM-swizzled scales.
+    """
     dtype = torch.bfloat16
     device = torch.device("cuda")
-    num_gemms, rows, in_features, out_features = 3, 256, 384, 256
+    num_gemms, in_features, out_features = 3, 384, 256
     input_shape = (
         (num_gemms, rows, in_features) if batch_dim == 0 else (rows, num_gemms, in_features)
     )
