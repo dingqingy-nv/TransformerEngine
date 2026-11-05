@@ -563,6 +563,37 @@ def test_mxfp8_swizzled_scales_match_compact(
 
 
 @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+def test_mxfp8_swizzled_weight_update_keeps_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Updates through a detached alias (as MCore's param.data) keep the weight's
+    GEMM-swizzled scales, and an update that would write compact scales raises."""
+    monkeypatch.setenv("NVTE_BATCHED_LINEAR_SWIZZLED_SCALES", "1")
+    dtype = torch.bfloat16
+    device = torch.device("cuda")
+    num_gemms, in_features, out_features = 3, 256, 128
+    recipe = make_recipe("mxfp8")
+    with te.quantized_model_init(enabled=True, recipe=recipe):
+        op = te_ops.BatchedLinear(
+            num_gemms, in_features, out_features, bias=False, dtype=dtype, device=device
+        )
+    assert op.weight._with_gemm_swizzled_scales
+
+    torch.manual_seed(1234)
+    weight = torch.randn(num_gemms, out_features, in_features, dtype=dtype, device=device)
+    with torch.no_grad():
+        op.weight.data.copy_(weight)
+    assert op.weight._with_gemm_swizzled_scales
+    quantizer = te.MXFP8Quantizer(fp8_dtype=op.weight._fp8_dtype)
+    torch.testing.assert_close(
+        op.weight.dequantize(), quantizer(weight).dequantize(), rtol=0, atol=0
+    )
+
+    op.weight._quantizer.optimize_for_gemm = False
+    with pytest.raises(ValueError, match="compact scales into a tensor with GEMM-swizzled"):
+        with torch.no_grad():
+            op.weight.data.copy_(weight)
+
+
+@pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
 @pytest.mark.parametrize("backward_override", ("high_precision", "dequantized"))
 def test_rejects_backward_override(backward_override: str) -> None:
     """MXFP8 backward overrides are not implemented."""

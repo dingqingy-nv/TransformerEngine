@@ -104,6 +104,17 @@ class MXFP8Quantizer(Quantizer):
 
         assert isinstance(dst, MXFP8Tensor), f"Cannot store quantized MXFP8 in {type(dst)} type."
 
+        # The cast writes scales in this quantizer's layout but records the layout
+        # only on dst, which may be a detached alias of a parameter (param.data). A
+        # tensor that keeps GEMM-swizzled scales (MXFP8 primary weights with
+        # NVTE_MXFP8_PRESWIZZLE_PRIMARY_WEIGHTS=1, BatchedLinear weights) must not
+        # receive compact ones.
+        if dst._with_gemm_swizzled_scales and not self.optimize_for_gemm:
+            raise ValueError(
+                "MXFP8 update would write compact scales into a tensor with GEMM-swizzled "
+                "scales; update it with a quantizer that has optimize_for_gemm=True."
+            )
+
         # Make sure input is in expected format
         if not devices_match(src.device, dst.device):
             src = src.to(device=dst.device)
