@@ -271,7 +271,9 @@ def test_save_original_input(monkeypatch: pytest.MonkeyPatch, batch_dim: int) ->
     input_quantizations = []
     original_quantize = batched_linear_op.BatchedLinear._quantize_for_batched_gemm
 
-    def capture_quantize(tensor, quantizer, batch_dim_, num_gemms_, *, rowwise, columnwise):
+    def capture_quantize(
+        tensor, quantizer, batch_dim_, num_gemms_, *, rowwise, columnwise, swizzled=False
+    ):
         quantized = original_quantize(
             tensor,
             quantizer,
@@ -279,6 +281,7 @@ def test_save_original_input(monkeypatch: pytest.MonkeyPatch, batch_dim: int) ->
             num_gemms_,
             rowwise=rowwise,
             columnwise=columnwise,
+            swizzled=swizzled,
         )
         if tensor.data_ptr() == inp.data_ptr():
             input_quantizations.append((quantized, rowwise, columnwise))
