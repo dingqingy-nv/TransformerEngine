@@ -471,8 +471,9 @@ PackedMXFP8Operand pack_mxfp8_operand_scales(py::handle operand,
                                              int64_t batch_stride, const char* name) {
   NVTE_CHECK(rows_per_batch > 0 && features > 0 && batch_count > 0,
              "MXFP8 strided batched GEMM requires positive dimensions for ", name, ".");
-  NVTE_CHECK(!operand_tensor.get_with_gemm_swizzled_scales(),
-             "strided_batched_gemm expects compact MXFP8 scales for ", name, ".");
+  // Swizzled scales must already be packed by batch in the GEMM-swizzled layout
+  // and are used as-is; compact scales are packed here.
+  const bool prepacked = operand_tensor.get_with_gemm_swizzled_scales();
 
   const char* data_attr = rowwise ? "_rowwise_data" : "_columnwise_data";
   const char* scale_attr = rowwise ? "_rowwise_scale_inv" : "_columnwise_scale_inv";
@@ -527,6 +528,16 @@ PackedMXFP8Operand pack_mxfp8_operand_scales(py::handle operand,
   const auto input_data =
       rowwise ? operand_tensor.get_rowwise_data() : operand_tensor.get_columnwise_data();
 
+  auto use_or_allocate_packed_scales = [&](int64_t output_numel) {
+    if (!prepacked) {
+      return at::empty({output_numel}, scale_inv.options());
+    }
+    NVTE_CHECK(scale_inv.numel() == output_numel, "MXFP8 strided_batched_gemm ", name,
+               " pre-packed scale buffer has invalid size (expected ", output_numel, ", got ",
+               scale_inv.numel(), ").");
+    return scale_inv;
+  };
+
   TensorWrapper compact_tensor(NVTE_MXFP8_1D_SCALING);
   PackedMXFP8Operand packed;
   if (rowwise) {
@@ -536,7 +547,7 @@ PackedMXFP8Operand pack_mxfp8_operand_scales(py::handle operand,
     const int64_t scale_cols = round_up(features / 32, 4, name);
     const int64_t output_numel =
         checked_mul(batch_count, checked_mul(scale_rows, scale_cols, name), name);
-    packed.scale_inv = at::empty({output_numel}, scale_inv.options());
+    packed.scale_inv = use_or_allocate_packed_scales(output_numel);
     compact_tensor.set_rowwise_data(input_data.data_ptr, static_cast<DType>(input_data.dtype),
                                     logical_shape);
     compact_tensor.set_rowwise_scale_inv(scale_inv.data_ptr(), DType::kFloat8E8M0,
@@ -552,7 +563,7 @@ PackedMXFP8Operand pack_mxfp8_operand_scales(py::handle operand,
     const int64_t scale_cols = round_up(features, 128, name);
     const int64_t output_numel =
         checked_mul(batch_count, checked_mul(scale_rows, scale_cols, name), name);
-    packed.scale_inv = at::empty({output_numel}, scale_inv.options());
+    packed.scale_inv = use_or_allocate_packed_scales(output_numel);
     compact_tensor.set_columnwise_data(input_data.data_ptr, static_cast<DType>(input_data.dtype),
                                        logical_shape);
     compact_tensor.set_columnwise_scale_inv(scale_inv.data_ptr(), DType::kFloat8E8M0,
@@ -563,6 +574,9 @@ PackedMXFP8Operand pack_mxfp8_operand_scales(py::handle operand,
                                            getTensorShape(packed.scale_inv));
   }
   packed.tensor.set_with_gemm_swizzled_scales(true);
+  if (prepacked) {
+    return packed;
+  }
 
   NVTE_SCOPED_GIL_RELEASE({
     if (rowwise) {

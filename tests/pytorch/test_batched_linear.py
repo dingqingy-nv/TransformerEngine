@@ -501,6 +501,59 @@ def test_rejects_non_mxfp8_recipe(recipe) -> None:
 
 
 @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+@pytest.mark.parametrize("batch_dim", (0, -2))
+@pytest.mark.parametrize("quantized_weight", (False, True))
+@pytest.mark.parametrize("save_original_input", (False, True))
+def test_mxfp8_swizzled_scales_match_compact(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    batch_dim: int,
+    quantized_weight: bool,
+    save_original_input: bool,
+) -> None:
+    """Scales packed per GEMM at quantization reproduce GEMM-side packing bitwise."""
+    dtype = torch.bfloat16
+    device = torch.device("cuda")
+    num_gemms, rows, in_features, out_features = 3, 256, 384, 256
+    input_shape = (
+        (num_gemms, rows, in_features) if batch_dim == 0 else (rows, num_gemms, in_features)
+    )
+    output_shape = input_shape[:-1] + (out_features,)
+    torch.manual_seed(1234)
+    inp = torch.randn(input_shape, dtype=dtype, device=device)
+    weight = torch.randn(num_gemms, out_features, in_features, dtype=dtype, device=device)
+    grad_output = torch.randn(output_shape, dtype=dtype, device=device)
+
+    recipe = make_recipe("mxfp8")
+    results = []
+    for swizzled in (False, True):
+        monkeypatch.setenv("NVTE_BATCHED_LINEAR_SWIZZLED_SCALES", str(int(swizzled)))
+        with te.quantized_model_init(enabled=quantized_weight, recipe=recipe):
+            op = te_ops.BatchedLinear(
+                num_gemms,
+                in_features,
+                out_features,
+                batch_dim=batch_dim,
+                bias=False,
+                save_original_input=save_original_input,
+                dtype=dtype,
+                device=device,
+            )
+        with torch.no_grad():
+            op.weight.copy_(weight)
+        if quantized_weight:
+            assert op.weight._with_gemm_swizzled_scales == swizzled
+        x = inp.detach().clone().requires_grad_()
+        with te.autocast(enabled=True, recipe=recipe):
+            y = op(x)
+        y.backward(grad_output)
+        results.append((y, x.grad, op.weight.grad))
+
+    for ref, test in zip(*results):
+        torch.testing.assert_close(test, ref, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
 @pytest.mark.parametrize("backward_override", ("high_precision", "dequantized"))
 def test_rejects_backward_override(backward_override: str) -> None:
     """MXFP8 backward overrides are not implemented."""

@@ -25,7 +25,7 @@ nvfp4_available, reason_for_no_nvfp4 = te.is_nvfp4_available(return_reason=True)
 _UNSUPPORTED_INPUT_ERROR = (
     "strided_batched_gemm supports only high-precision or MXFP8 A and B tensor pairs"
 )
-_SWIZZLED_MXFP8_ERROR = "strided_batched_gemm expects compact MXFP8 scales"
+_PREPACKED_SCALE_SIZE_ERROR = "pre-packed scale buffer has invalid size"
 
 
 def _skip_if_unavailable(recipe):
@@ -286,12 +286,14 @@ def test_strided_batched_gemm_interleaved_activation(recipe, accumulate):
 
 
 @pytest.mark.parametrize("api", ["python", "cpp"])
-def test_strided_batched_gemm_rejects_swizzled_mxfp8_scales(api):
+def test_strided_batched_gemm_rejects_missized_prepacked_mxfp8_scales(api):
+    """Swizzled scales are taken as packed per batch; 2D-swizzled scales of the
+    wrong size are rejected."""
     _skip_if_unavailable("mxfp8")
 
     torch.manual_seed(1234)
     dtype = torch.bfloat16
-    seq, micro_batch, groups, hidden, out_features = 12, 8, 3, 160, 96
+    seq, micro_batch, groups, hidden, out_features = 12, 8, 3, 160, 64
     rows = seq * micro_batch
     x = torch.randn(seq, micro_batch, groups, hidden, dtype=dtype, device="cuda")
     w = torch.randn(groups, out_features, hidden, dtype=dtype, device="cuda")
@@ -312,10 +314,10 @@ def test_strided_batched_gemm_rejects_swizzled_mxfp8_scales(api):
         "strided": out_features,
     }
     if api == "python":
-        with pytest.raises(AssertionError, match=_SWIZZLED_MXFP8_ERROR):
+        with pytest.raises(RuntimeError, match=_PREPACKED_SCALE_SIZE_ERROR):
             strided_batched_gemm(A, B, out, layout="TN", **kwargs)
     else:
-        with pytest.raises(RuntimeError, match=_SWIZZLED_MXFP8_ERROR):
+        with pytest.raises(RuntimeError, match=_PREPACKED_SCALE_SIZE_ERROR):
             _cpp_strided_batched_gemm(A, B, out, **kwargs)
 
 

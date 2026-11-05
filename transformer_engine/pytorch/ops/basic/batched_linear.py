@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 import contextlib
+import os
 from typing import Any, Optional
 import warnings
 
@@ -40,6 +41,10 @@ from ..op import BasicOperation, OperationContext
 
 
 _HIGH_PRECISION_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+# GEMM-swizzled MXFP8 scales are stored as 128x4 tiles of E8M0 bytes.
+_MXFP8_SCALE_TILE_ROWS = 128
+_MXFP8_SCALE_TILE_COLS = 4
 
 
 class BatchedLinear(BasicOperation):
@@ -90,6 +95,13 @@ class BatchedLinear(BasicOperation):
     Constructing this operation under ``quantized_model_init`` supports only
     an MXFP8 recipe. Meta-device parameter materialization relies on the
     operation fuser's deferred-initialization support.
+
+    With MXFP8 compute and ``in_features``, ``out_features`` and the rows per
+    GEMM all divisible by 128, operands are quantized with GEMM-swizzled scales
+    and packed per GEMM here, by a tile reorder or not at all, instead of by
+    the strided batched GEMM's scale-packing kernels. An MXFP8 weight then
+    keeps GEMM-swizzled scales. Set ``NVTE_BATCHED_LINEAR_SWIZZLED_SCALES=0``
+    at construction to keep compact scales.
     """
 
     num_extra_outputs: int = 0
@@ -146,6 +158,14 @@ class BatchedLinear(BasicOperation):
         self._accumulate_into_main_grad = accumulate_into_main_grad
         self.save_original_input = save_original_input
         self._init_method = get_default_init_method() if init_method is None else init_method
+
+        # Fixed at construction: an MXFP8 weight must keep one scale layout for
+        # its lifetime, since CUDA graphs capture the GEMMs that read it.
+        self._swizzled_scales = (
+            bool(int(os.getenv("NVTE_BATCHED_LINEAR_SWIZZLED_SCALES", "1")))
+            and in_features % _MXFP8_SCALE_TILE_ROWS == 0
+            and out_features % _MXFP8_SCALE_TILE_ROWS == 0
+        )
 
         # Initialize recipe state if the weight itself is stored in MXFP8.
         self._with_quantized_weight = FP8GlobalStateManager.with_fp8_parameters()
@@ -205,7 +225,11 @@ class BatchedLinear(BasicOperation):
                     "but no quantizer was available. The forward pass must run under "
                     "MXFP8 autocast."
                 )
-            self._configure_quantizer(quantizer, internal=False)
+            self._configure_quantizer(
+                quantizer,
+                internal=False,
+                optimize_for_gemm=self._swizzled_scales,
+            )
             quantizer.set_usage(rowwise=True, columnwise=torch.is_grad_enabled())
             with torch.no_grad():
                 weight = quantizer(weight)
@@ -266,12 +290,17 @@ class BatchedLinear(BasicOperation):
         return None
 
     @staticmethod
-    def _configure_quantizer(quantizer: Quantizer, *, internal: bool = True) -> None:
+    def _configure_quantizer(
+        quantizer: Quantizer,
+        *,
+        internal: bool = True,
+        optimize_for_gemm: bool = False,
+    ) -> None:
         if not isinstance(quantizer, MXFP8Quantizer):
             raise RuntimeError("BatchedLinear expected an MXFP8 quantizer")
         quantizer.set_usage(rowwise=True, columnwise=False)
         quantizer.internal = internal
-        quantizer.optimize_for_gemm = False
+        quantizer.optimize_for_gemm = optimize_for_gemm
 
     @staticmethod
     def _validate_recipe(recipe: Recipe) -> None:
@@ -304,6 +333,7 @@ class BatchedLinear(BasicOperation):
                 or getattr(self, "_with_quantized_weight", False)
                 or weight_is_quantized
             ),
+            optimize_for_gemm=getattr(self, "_swizzled_scales", False),
         )
         self._configure_quantizer(self.get_quantizer("backward", 0))
 
@@ -327,6 +357,7 @@ class BatchedLinear(BasicOperation):
                 getattr(self, "_with_quantized_weight", False)
                 or is_quantized_tensor(getattr(self, "weight", None))
             ),
+            optimize_for_gemm=self._swizzled_scales,
         )
         self._configure_quantizer(self.get_quantizer("backward", 0))
 
@@ -382,8 +413,16 @@ class BatchedLinear(BasicOperation):
             raise ValueError("BatchedLinear requires a contiguous weight")
         if is_quantized_tensor(self.weight) and not isinstance(self.weight, MXFP8TensorStorage):
             raise ValueError("BatchedLinear supports only MXFP8 quantized weights")
-        if isinstance(self.weight, MXFP8TensorStorage) and self.weight._with_gemm_swizzled_scales:
-            raise ValueError("BatchedLinear quantized weights must use compact MXFP8 scales")
+        if (
+            isinstance(self.weight, MXFP8TensorStorage)
+            and self.weight._with_gemm_swizzled_scales
+            and not self._swizzled_scales
+        ):
+            raise ValueError(
+                "BatchedLinear quantized weights with GEMM-swizzled MXFP8 scales require "
+                "in_features and out_features divisible by 128 and "
+                "NVTE_BATCHED_LINEAR_SWIZZLED_SCALES=1"
+            )
 
         if self.use_bias:
             if self.bias is None:
@@ -420,6 +459,9 @@ class BatchedLinear(BasicOperation):
                     f"MXFP8 BatchedLinear requires {name} divisible by 32 (got {size})"
                 )
 
+    def _swizzled_activation_scales(self, rows: int) -> bool:
+        return self._swizzled_scales and rows % _MXFP8_SCALE_TILE_ROWS == 0
+
     @staticmethod
     def _quantize_for_batched_gemm(
         tensor: torch.Tensor,
@@ -429,6 +471,7 @@ class BatchedLinear(BasicOperation):
         *,
         rowwise: bool,
         columnwise: bool,
+        swizzled: bool = False,
     ) -> MXFP8TensorStorage:
         if not isinstance(quantizer, MXFP8Quantizer):
             raise RuntimeError("BatchedLinear expected an MXFP8 quantizer")
@@ -437,12 +480,68 @@ class BatchedLinear(BasicOperation):
         features = tensor.size(-1)
         rows = tensor.numel() // (num_gemms * features)
         quantizer_input = tensor
-        if columnwise and batch_dim == -2:
+        if (columnwise or swizzled) and batch_dim == -2:
+            # Batches concatenated in the feature dimension: no scaling block
+            # spans two batches, and each batch's GEMM-swizzled scale tiles
+            # stay together (see _batched_gemm_operand).
             quantizer_input = tensor.view(rows, num_gemms * features)
         quantizer.set_usage(rowwise=rowwise, columnwise=columnwise)
         quantizer.internal = True
-        quantizer.optimize_for_gemm = False
+        quantizer.optimize_for_gemm = swizzled
         return quantizer(quantizer_input)
+
+    @staticmethod
+    def _batched_gemm_operand(
+        tensor: torch.Tensor,
+        num_gemms: int,
+        *,
+        rowwise: bool,
+        batch_in_features: bool,
+    ) -> torch.Tensor:
+        """Operand whose scales for one scaling direction are packed per GEMM.
+
+        High-precision tensors and MXFP8 tensors with compact scales are
+        returned as is; the strided batched GEMM packs compact scales.
+
+        GEMM-swizzled scales of the 2D quantized matrix are 128x4 tiles in
+        row-major tile order. Row-wise scale tiles stack along the data rows
+        and column-wise scale tiles along the features. If the batches stack
+        along the same dimension (row-wise scales of ``[G * M, K]``, column-wise
+        scales of ``[M, G * K]``), each batch's tiles are already contiguous.
+        Otherwise the batch is the outer part of the tile column index and is
+        moved in front of the tile rows, which reorders whole 512-byte tiles.
+        """
+        if not isinstance(tensor, MXFP8TensorStorage) or not tensor._with_gemm_swizzled_scales:
+            return tensor
+        if rowwise:
+            data, scale_inv = tensor._rowwise_data, tensor._rowwise_scale_inv
+            tile_rows = scale_inv.size(0) // _MXFP8_SCALE_TILE_ROWS
+            tile_cols = scale_inv.size(1) // _MXFP8_SCALE_TILE_COLS
+        else:
+            data, scale_inv = tensor._columnwise_data, tensor._columnwise_scale_inv
+            tile_rows = scale_inv.size(1) // _MXFP8_SCALE_TILE_ROWS
+            tile_cols = scale_inv.size(0) // _MXFP8_SCALE_TILE_COLS
+        if batch_in_features != rowwise:
+            packed_scale_inv = scale_inv
+        else:
+            # Move tiles as 64 eight-byte words.
+            packed_scale_inv = (
+                scale_inv.view(-1)
+                .view(torch.int64)
+                .view(tile_rows, num_gemms, tile_cols // num_gemms, -1)
+                .transpose(0, 1)
+                .contiguous()
+                .view(torch.uint8)
+            )
+        return MXFP8TensorStorage(
+            rowwise_data=data if rowwise else None,
+            rowwise_scale_inv=packed_scale_inv if rowwise else None,
+            columnwise_data=None if rowwise else data,
+            columnwise_scale_inv=None if rowwise else packed_scale_inv,
+            fp8_dtype=tensor._fp8_dtype,
+            quantizer=None,
+            with_gemm_swizzled_scales=True,
+        )
 
     @staticmethod
     def _validate_quantized_weight_usage(
@@ -512,8 +611,10 @@ class BatchedLinear(BasicOperation):
 
         gemm_x: torch.Tensor = x
         gemm_w: torch.Tensor = w
+        swizzled_activation_scales = False
         if with_mxfp8_compute:
             self._validate_mxfp8_dimensions(rows)
+            swizzled_activation_scales = self._swizzled_activation_scales(rows)
             gemm_x = self._quantize_for_batched_gemm(
                 x,
                 self.get_quantizer("forward", 0),
@@ -521,6 +622,7 @@ class BatchedLinear(BasicOperation):
                 self.num_gemms,
                 rowwise=True,
                 columnwise=weight_requires_grad and not save_original_input,
+                swizzled=swizzled_activation_scales,
             )
             if isinstance(w, MXFP8TensorStorage):
                 self._validate_quantized_weight_usage(w, columnwise=input_requires_grad)
@@ -533,6 +635,7 @@ class BatchedLinear(BasicOperation):
                     self.num_gemms,
                     rowwise=True,
                     columnwise=input_requires_grad,
+                    swizzled=self._swizzled_scales,
                 )
 
         output_shape = list(input_.shape)
@@ -541,8 +644,18 @@ class BatchedLinear(BasicOperation):
         ldb, strideb = self._matrix_strides(rows, self.in_features)
         ldd, strided = self._matrix_strides(rows, self.out_features)
         strided_batched_gemm(
-            gemm_w,
-            gemm_x,
+            self._batched_gemm_operand(
+                gemm_w,
+                self.num_gemms,
+                rowwise=True,
+                batch_in_features=False,
+            ),
+            self._batched_gemm_operand(
+                gemm_x,
+                self.num_gemms,
+                rowwise=True,
+                batch_in_features=self.batch_dim == -2,
+            ),
             output,
             m=self.out_features,
             n=rows,
@@ -572,6 +685,7 @@ class BatchedLinear(BasicOperation):
             ctx.rows = rows
             ctx.dtype = dtype
             ctx.with_mxfp8_compute = with_mxfp8_compute
+            ctx.swizzled_activation_scales = swizzled_activation_scales
             ctx.save_original_input = save_original_input
             ctx.input_quantizer = (
                 self.get_quantizer("forward", 0)
@@ -598,6 +712,7 @@ class BatchedLinear(BasicOperation):
             )
 
         gemm_dy = dy
+        batch_in_features = self.batch_dim == -2
         if ctx.with_mxfp8_compute:
             gemm_dy = self._quantize_for_batched_gemm(
                 dy,
@@ -606,6 +721,7 @@ class BatchedLinear(BasicOperation):
                 self.num_gemms,
                 rowwise=ctx.input_requires_grad,
                 columnwise=ctx.weight_requires_grad,
+                swizzled=ctx.swizzled_activation_scales,
             )
 
         grad_input = None
@@ -616,8 +732,18 @@ class BatchedLinear(BasicOperation):
             ldb, strideb = self._matrix_strides(ctx.rows, self.out_features)
             ldd, strided = self._matrix_strides(ctx.rows, self.in_features)
             strided_batched_gemm(
-                w,
-                gemm_dy,
+                self._batched_gemm_operand(
+                    w,
+                    self.num_gemms,
+                    rowwise=False,
+                    batch_in_features=False,
+                ),
+                self._batched_gemm_operand(
+                    gemm_dy,
+                    self.num_gemms,
+                    rowwise=True,
+                    batch_in_features=batch_in_features,
+                ),
                 grad_input,
                 m=self.in_features,
                 n=ctx.rows,
@@ -647,6 +773,7 @@ class BatchedLinear(BasicOperation):
                         self.num_gemms,
                         rowwise=False,
                         columnwise=True,
+                        swizzled=ctx.swizzled_activation_scales,
                     )
             accumulate_wgrad = False
             if self._accumulate_into_main_grad:
@@ -685,8 +812,18 @@ class BatchedLinear(BasicOperation):
             lda, stridea = self._matrix_strides(ctx.rows, self.in_features)
             ldb, strideb = self._matrix_strides(ctx.rows, self.out_features)
             strided_batched_gemm(
-                x,
-                gemm_dy,
+                self._batched_gemm_operand(
+                    x,
+                    self.num_gemms,
+                    rowwise=False,
+                    batch_in_features=batch_in_features,
+                ),
+                self._batched_gemm_operand(
+                    gemm_dy,
+                    self.num_gemms,
+                    rowwise=False,
+                    batch_in_features=batch_in_features,
+                ),
                 grad_weight,
                 m=self.in_features,
                 n=self.out_features,
