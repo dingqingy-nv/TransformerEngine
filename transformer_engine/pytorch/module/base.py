@@ -948,6 +948,11 @@ def quantize_weight(
 class TransformerEngineBaseModule(torch.nn.Module, ABC):
     """Base TE module."""
 
+    # Whether MXFP8 primary weights may keep GEMM-swizzled scales when
+    # NVTE_MXFP8_PRESWIZZLE_PRIMARY_WEIGHTS=1 (see _enable_weight_preswizzle).
+    # Only for modules whose weights are consumed by TE GEMMs alone.
+    _preswizzle_primary_mxfp8_weights: bool = False
+
     def __init__(self, name: Optional[str] = None) -> None:
         super().__init__()
         if not torch.cuda.is_available():
@@ -1340,15 +1345,25 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         """Whether to fuse scale-factor swizzling into weight quantization.
 
         When enabled, scales are preswizzled during quantization instead of lazily
-        inside every GEMM. Disabled when primary weights are already quantized
-        (dequant and FSDP2 all-gather expect the unswizzled layout). For NVFP4,
+        inside every GEMM. Disabled by default when primary weights are already
+        quantized (FSDP2 all-gather, partial casts of sharded master weights and
+        consumers of the raw weight storage expect the unswizzled layout). With
+        NVTE_MXFP8_PRESWIZZLE_PRIMARY_WEIGHTS=1, MXFP8 primary weights of modules
+        that set _preswizzle_primary_mxfp8_weights are created and requantized
+        with GEMM-swizzled scales, so their GEMMs no longer swizzle the weight
+        scales on every call. Such weights must be updated by full requantization
+        (copy_ or quantize_). For NVFP4,
         enabled only for shapes/architectures where the fused swizzle+quantize
         kernel is supported. Weight quantization always uses the single-tensor
         kernel (including GroupedLinear's cached weights), so NVFP4 RHT
         eligibility uses that kernel's 64-row alignment.
         """
         if self.primary_weights_in_fp8:
-            return False
+            return (
+                self._preswizzle_primary_mxfp8_weights
+                and isinstance(quantizer, MXFP8Quantizer)
+                and bool(int(os.getenv("NVTE_MXFP8_PRESWIZZLE_PRIMARY_WEIGHTS", "0")))
+            )
         if isinstance(quantizer, MXFP8Quantizer):
             return True
         if isinstance(quantizer, NVFP4Quantizer):
@@ -1905,6 +1920,9 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                     raise RuntimeError("Weight quantizer has not been initialized")
                 quantizer.set_usage(rowwise=True, columnwise=torch.is_grad_enabled())
                 quantizer.internal = False
+                # Create the weight in the scale layout that forward() selects, so the
+                # layout does not change after CUDA graphs capture its GEMMs.
+                quantizer.optimize_for_gemm = self._enable_weight_preswizzle(quantizer, param)
                 # HybridQuantizer is included so its current-scaling / NVFP4
                 # sub-quantizers get the same cross-shard amax reduction as the
                 # vanilla path (no-op for block-scaled sub-quantizers like MXFP8).

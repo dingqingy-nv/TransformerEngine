@@ -1995,6 +1995,8 @@ class Linear(TransformerEngineBaseModule):
                        original input. Cannot work with FP8 DelayedScaling recipe.
     """
 
+    _preswizzle_primary_mxfp8_weights = True
+
     def __init__(
         self,
         in_features: int,

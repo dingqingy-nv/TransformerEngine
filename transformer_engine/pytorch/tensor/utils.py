@@ -1053,6 +1053,12 @@ def _cast_master_weights_to_fp8_mxfp8_scaling(
     cu_rowwise_amax_sizes = [0]
     cu_colwise_amax_sizes = [0]
     for model_weight, _, _, _ in params:
+        if model_weight._with_gemm_swizzled_scales:
+            raise ValueError(
+                "Partial MXFP8 casts write compact scales, but a model weight has "
+                "GEMM-swizzled scales (NVTE_MXFP8_PRESWIZZLE_PRIMARY_WEIGHTS=1). Update "
+                "such weights by full requantization instead."
+            )
         rowwise_shape = model_weight._rowwise_scale_inv.shape
         if len(rowwise_shape) != 2:
             raise ValueError(
