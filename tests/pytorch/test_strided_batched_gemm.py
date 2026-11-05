@@ -25,6 +25,7 @@ nvfp4_available, reason_for_no_nvfp4 = te.is_nvfp4_available(return_reason=True)
 _UNSUPPORTED_INPUT_ERROR = (
     "strided_batched_gemm supports only high-precision or MXFP8 A and B tensor pairs"
 )
+_SWIZZLED_MXFP8_ERROR = "strided_batched_gemm expects compact MXFP8 scales"
 _PREPACKED_SCALE_SIZE_ERROR = "pre-packed scale buffer has invalid size"
 
 
@@ -285,15 +286,10 @@ def test_strided_batched_gemm_interleaved_activation(recipe, accumulate):
     torch.testing.assert_close(out, ref, rtol=0.125, atol=0.0675)
 
 
-@pytest.mark.parametrize("api", ["python", "cpp"])
-def test_strided_batched_gemm_rejects_missized_prepacked_mxfp8_scales(api):
-    """Swizzled scales are taken as packed per batch; 2D-swizzled scales of the
-    wrong size are rejected."""
-    _skip_if_unavailable("mxfp8")
-
+def _swizzled_mxfp8_operands(out_features):
     torch.manual_seed(1234)
     dtype = torch.bfloat16
-    seq, micro_batch, groups, hidden, out_features = 12, 8, 3, 160, 64
+    seq, micro_batch, groups, hidden = 12, 8, 3, 160
     rows = seq * micro_batch
     x = torch.randn(seq, micro_batch, groups, hidden, dtype=dtype, device="cuda")
     w = torch.randn(groups, out_features, hidden, dtype=dtype, device="cuda")
@@ -313,6 +309,33 @@ def test_strided_batched_gemm_rejects_missized_prepacked_mxfp8_scales(api):
         "ldd": groups * out_features,
         "strided": out_features,
     }
+    return A, B, out, kwargs
+
+
+@pytest.mark.parametrize("api", ["python", "cpp"])
+def test_strided_batched_gemm_rejects_swizzled_mxfp8_scales(api):
+    """GEMM-swizzled scales not marked as packed per batch are rejected, also
+    where their size equals the packed size (3 x 96 rows here)."""
+    _skip_if_unavailable("mxfp8")
+
+    A, B, out, kwargs = _swizzled_mxfp8_operands(out_features=96)
+    if api == "python":
+        with pytest.raises(AssertionError, match=_SWIZZLED_MXFP8_ERROR):
+            strided_batched_gemm(A, B, out, layout="TN", **kwargs)
+    else:
+        with pytest.raises(RuntimeError, match=_SWIZZLED_MXFP8_ERROR):
+            _cpp_strided_batched_gemm(A, B, out, **kwargs)
+
+
+@pytest.mark.parametrize("api", ["python", "cpp"])
+def test_strided_batched_gemm_rejects_missized_prepacked_mxfp8_scales(api):
+    """Scales marked as packed per batch are used as is; a buffer of the wrong
+    size is rejected."""
+    _skip_if_unavailable("mxfp8")
+
+    A, B, out, kwargs = _swizzled_mxfp8_operands(out_features=64)
+    A._with_batched_gemm_packed_scales = True
+    B._with_batched_gemm_packed_scales = True
     if api == "python":
         with pytest.raises(RuntimeError, match=_PREPACKED_SCALE_SIZE_ERROR):
             strided_batched_gemm(A, B, out, layout="TN", **kwargs)

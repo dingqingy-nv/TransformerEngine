@@ -510,6 +510,9 @@ class BatchedLinear(BasicOperation):
         scales of ``[M, G * K]``), each batch's tiles are already contiguous.
         Otherwise the batch is the outer part of the tile column index and is
         moved in front of the tile rows, which reorders whole 512-byte tiles.
+        The returned operand is marked ``_with_batched_gemm_packed_scales``, so
+        the strided batched GEMM uses its scales as is; it rejects any other
+        operand with GEMM-swizzled scales.
         """
         if not isinstance(tensor, MXFP8TensorStorage) or not tensor._with_gemm_swizzled_scales:
             return tensor
@@ -533,7 +536,7 @@ class BatchedLinear(BasicOperation):
                 .contiguous()
                 .view(torch.uint8)
             )
-        return MXFP8TensorStorage(
+        operand = MXFP8TensorStorage(
             rowwise_data=data if rowwise else None,
             rowwise_scale_inv=packed_scale_inv if rowwise else None,
             columnwise_data=None if rowwise else data,
@@ -542,6 +545,8 @@ class BatchedLinear(BasicOperation):
             quantizer=None,
             with_gemm_swizzled_scales=True,
         )
+        operand._with_batched_gemm_packed_scales = True
+        return operand
 
     @staticmethod
     def _validate_quantized_weight_usage(

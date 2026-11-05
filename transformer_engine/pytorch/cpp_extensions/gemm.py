@@ -977,10 +977,11 @@ def strided_batched_gemm(
     Inputs must both be high-precision tensors or both be MXFP8 tensors. For an
     MXFP8 operand with compact scales, the extension packs and GEMM-swizzles the
     required scaling direction before launching cuBLASLt. An operand with
-    swizzled scales must hold that direction's scales already packed: one
-    GEMM-swizzled block per batch entry, batch entries back to back. MXFP8
-    operand strides must describe a contiguous ``[G, ..., D]`` or ``[..., G, D]``
-    layout.
+    swizzled scales is accepted only if it is marked
+    ``_with_batched_gemm_packed_scales`` (as BatchedLinear marks its operands)
+    and holds that direction's scales already packed: one GEMM-swizzled block
+    per batch entry, batch entries back to back. MXFP8 operand strides must
+    describe a contiguous ``[G, ..., D]`` or ``[..., G, D]`` layout.
     """
     assert layout in ("TN", "NN", "NT"), f"GEMM layout {layout} not supported."
     high_precision_dtypes = (torch.float32, torch.float16, torch.bfloat16)
@@ -994,6 +995,15 @@ def strided_batched_gemm(
     assert (
         high_precision_inputs or mxfp8_inputs
     ), "strided_batched_gemm supports only high-precision or MXFP8 A and B tensor pairs."
+    if mxfp8_inputs:
+        assert all(
+            not tensor._with_gemm_swizzled_scales
+            or getattr(tensor, "_with_batched_gemm_packed_scales", False)
+            for tensor in (A, B)
+        ), (
+            "strided_batched_gemm expects compact MXFP8 scales, or GEMM-swizzled scales "
+            "marked as packed per batch."
+        )
     transa = layout[0] == "T"
     transb = layout[1] == "T"
     beta = validate_gemm_scale(beta, accumulate)

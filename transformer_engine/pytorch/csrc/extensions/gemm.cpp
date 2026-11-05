@@ -471,9 +471,14 @@ PackedMXFP8Operand pack_mxfp8_operand_scales(py::handle operand,
                                              int64_t batch_stride, const char* name) {
   NVTE_CHECK(rows_per_batch > 0 && features > 0 && batch_count > 0,
              "MXFP8 strided batched GEMM requires positive dimensions for ", name, ".");
-  // Swizzled scales must already be packed by batch in the GEMM-swizzled layout
-  // and are used as-is; compact scales are packed here.
+  // Compact scales are packed here. Swizzled scales are used as-is, and only from
+  // an operand marked as already packed by batch in the GEMM-swizzled layout
+  // (BatchedLinear); a 2D-swizzled tensor can have the same scale size.
   const bool prepacked = operand_tensor.get_with_gemm_swizzled_scales();
+  NVTE_CHECK(!prepacked || (py::hasattr(operand, "_with_batched_gemm_packed_scales") &&
+                            operand.attr("_with_batched_gemm_packed_scales").cast<bool>()),
+             "strided_batched_gemm expects compact MXFP8 scales for ", name,
+             ", or GEMM-swizzled scales marked as packed per batch.");
 
   const char* data_attr = rowwise ? "_rowwise_data" : "_columnwise_data";
   const char* scale_attr = rowwise ? "_rowwise_scale_inv" : "_columnwise_scale_inv";
